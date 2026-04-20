@@ -58,7 +58,6 @@ import {
   type Time,
   type UTCTimestamp,
 } from "lightweight-charts";
-import { sampleChartDataByWidth, type ChartPoint } from "../utils/chartSampling";
 
 interface Stock {
   name: string;
@@ -75,31 +74,37 @@ interface HoverInfo {
   y: number;
 }
 
-interface IntradayPoint extends ChartPoint {
+interface IntradayPoint {
+  time: UTCTimestamp;
+  realTime: number;
+  marketTime: string;
+  minuteIndex: number;
+  value: number;
   avgPrice: number;
 }
 
 const STOCK_CODE = "0.002361";
 const MARKET_TIME_ZONE = "Asia/Shanghai";
 const MARKET_UTC_OFFSET_HOURS = 8;
+const MORNING_SESSION_START_MINUTE = 9 * 60 + 30;
+const MORNING_SESSION_END_MINUTE = 11 * 60 + 30;
+const AFTERNOON_SESSION_START_MINUTE = 13 * 60;
+const AFTERNOON_SESSION_END_MINUTE = 15 * 60;
+const MORNING_SESSION_POINT_COUNT = MORNING_SESSION_END_MINUTE - MORNING_SESSION_START_MINUTE + 1;
+const TOTAL_TRADING_POINT_COUNT =
+  MORNING_SESSION_POINT_COUNT + (AFTERNOON_SESSION_END_MINUTE - AFTERNOON_SESSION_START_MINUTE + 1);
+const LAST_TRADING_MINUTE_INDEX = TOTAL_TRADING_POINT_COUNT - 1;
+const SYNTHETIC_TIME_BASE_SECONDS = 0;
 const TRADING_POLL_INTERVAL_MS = 1000 * 3;
 const OFF_HOURS_POLL_INTERVAL_MS = 1000 * 60 * 2;
 const HIDDEN_POLL_INTERVAL_MS = 1000 * 60 * 3;
 
-type SeriesPoint = { time: UTCTimestamp; value: number };
-
-const SH_TIME_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
-  timeZone: MARKET_TIME_ZONE,
-  hour: "2-digit",
-  minute: "2-digit",
-  hour12: false,
-});
+type SeriesPoint = { time: UTCTimestamp; value?: number };
 
 const isExpanded = ref(false);
 const shouldFlash = ref(false);
 const chartContainerRef = ref<HTMLDivElement | null>(null);
 const tooltipRef = ref<HTMLDivElement | null>(null);
-const chartWidth = ref(0);
 const rawData = ref<IntradayPoint[]>([]);
 const hoverInfo = ref<HoverInfo | null>(null);
 const preClosePrice = ref(0);
@@ -118,8 +123,6 @@ let resizeObserver: ResizeObserver | null = null;
 let pollingTimer: ReturnType<typeof setTimeout> | null = null;
 let fetchController: AbortController | null = null;
 let isMounted = false;
-let appliedSeriesData: SeriesPoint[] = [];
-let appliedAvgSeriesData: SeriesPoint[] = [];
 let lastAppliedTrendColor = "";
 
 const trendClass = computed(() => (stockData.value.percent >= 0 ? "up" : "down"));
@@ -127,7 +130,7 @@ const trendColor = computed(() => (stockData.value.percent >= 0 ? "#f23645" : "#
 
 const latestTime = computed(() => {
   const lastPoint = rawData.value[rawData.value.length - 1];
-  return lastPoint ? formatMarketTimeFromTimestamp(lastPoint.time) : "";
+  return lastPoint ? lastPoint.marketTime : "";
 });
 
 const displayTime = computed(() => hoverInfo.value?.time ?? latestTime.value);
@@ -140,19 +143,41 @@ const hoverPercentText = computed(() => {
   return `${hoverInfo.value.percent > 0 ? "+" : ""}${hoverInfo.value.percent.toFixed(2)}%`;
 });
 
-const sampledData = computed<IntradayPoint[]>(() => sampleChartDataByWidth(rawData.value, chartWidth.value));
-const sampledSeriesData = computed<SeriesPoint[]>(() =>
-  sampledData.value.map((point) => ({
-    time: point.time as UTCTimestamp,
-    value: point.value,
-  })),
-);
-const sampledAvgSeriesData = computed<SeriesPoint[]>(() =>
-  sampledData.value.map((point) => ({
-    time: point.time as UTCTimestamp,
-    value: point.avgPrice,
-  })),
-);
+const pointByMinuteIndex = computed(() => new Map(rawData.value.map((point) => [point.minuteIndex, point])));
+const seriesData = computed<SeriesPoint[]>(() => {
+  const data: SeriesPoint[] = [];
+  for (let minuteIndex = 0; minuteIndex <= LAST_TRADING_MINUTE_INDEX; minuteIndex += 1) {
+    const point = pointByMinuteIndex.value.get(minuteIndex);
+    data.push(
+      point
+        ? {
+            time: point.time,
+            value: point.value,
+          }
+        : {
+            time: minuteIndexToSyntheticTimestamp(minuteIndex),
+          },
+    );
+  }
+  return data;
+});
+const avgSeriesData = computed<SeriesPoint[]>(() => {
+  const data: SeriesPoint[] = [];
+  for (let minuteIndex = 0; minuteIndex <= LAST_TRADING_MINUTE_INDEX; minuteIndex += 1) {
+    const point = pointByMinuteIndex.value.get(minuteIndex);
+    data.push(
+      point
+        ? {
+            time: point.time,
+            value: point.avgPrice,
+          }
+        : {
+            time: minuteIndexToSyntheticTimestamp(minuteIndex),
+          },
+    );
+  }
+  return data;
+});
 const pointIndex = computed(() => new Map(rawData.value.map((point) => [point.time, point])));
 
 const formatPriceAsPercent = (price: number): string => {
@@ -164,14 +189,105 @@ const formatPriceAsPercent = (price: number): string => {
 };
 
 const getTimestampFromTime = (time: Time | undefined): number | null => {
-  if (!time) return null;
+  if (time === undefined) return null;
   if (typeof time === "number") return time;
   if (typeof time === "object" && "timestamp" in time && typeof time.timestamp === "number") return time.timestamp;
   return null;
 };
 
-const formatMarketTimeFromTimestamp = (timestamp: number): string => {
-  return SH_TIME_FORMATTER.format(new Date(timestamp * 1000));
+const minuteIndexToSyntheticTimestamp = (minuteIndex: number): UTCTimestamp => {
+  return (SYNTHETIC_TIME_BASE_SECONDS + minuteIndex * 60) as UTCTimestamp;
+};
+
+const syntheticTimestampToMinuteIndex = (timestamp: number): number | null => {
+  const minuteIndex = Math.round((timestamp - SYNTHETIC_TIME_BASE_SECONDS) / 60);
+  if (!Number.isInteger(minuteIndex)) return null;
+  if (minuteIndex < 0 || minuteIndex > LAST_TRADING_MINUTE_INDEX) return null;
+  return minuteIndex;
+};
+
+const shanghaiMinutesFromTimestamp = (timestamp: number): number => {
+  const shanghaiDate = new Date((timestamp + MARKET_UTC_OFFSET_HOURS * 3600) * 1000);
+  return shanghaiDate.getUTCHours() * 60 + shanghaiDate.getUTCMinutes();
+};
+
+const shanghaiMinutesToTradingMinuteIndex = (minutes: number): number | null => {
+  if (minutes >= MORNING_SESSION_START_MINUTE && minutes <= MORNING_SESSION_END_MINUTE) {
+    return minutes - MORNING_SESSION_START_MINUTE;
+  }
+
+  if (minutes >= AFTERNOON_SESSION_START_MINUTE && minutes <= AFTERNOON_SESSION_END_MINUTE) {
+    return MORNING_SESSION_POINT_COUNT + (minutes - AFTERNOON_SESSION_START_MINUTE);
+  }
+
+  return null;
+};
+
+const timestampToTradingMinuteIndex = (timestamp: number): number | null => {
+  return shanghaiMinutesToTradingMinuteIndex(shanghaiMinutesFromTimestamp(timestamp));
+};
+
+const extractMarketMinutesFromDateTimeText = (dateTimeText: string): number | null => {
+  const fullDateTimeMatch = dateTimeText.match(/^\d{4}-\d{2}-\d{2}\s+(\d{2}):(\d{2})$/);
+  if (fullDateTimeMatch) {
+    return Number(fullDateTimeMatch[1]) * 60 + Number(fullDateTimeMatch[2]);
+  }
+
+  const timeOnlyMatch = dateTimeText.match(/^(\d{2}):(\d{2})$/);
+  if (timeOnlyMatch) {
+    return Number(timeOnlyMatch[1]) * 60 + Number(timeOnlyMatch[2]);
+  }
+
+  return null;
+};
+
+const dateTimeTextToTradingMinuteIndex = (dateTimeText: string): number | null => {
+  const minutes = extractMarketMinutesFromDateTimeText(dateTimeText);
+  if (typeof minutes !== "number") return null;
+  return shanghaiMinutesToTradingMinuteIndex(minutes);
+};
+
+const formatClockFromMinutes = (minutes: number): string => {
+  const hour = Math.floor(minutes / 60);
+  const minute = minutes % 60;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+};
+
+const formatMarketTimeFromMinuteIndex = (minuteIndex: number): string => {
+  if (minuteIndex < 0 || minuteIndex > LAST_TRADING_MINUTE_INDEX) return "";
+  if (minuteIndex < MORNING_SESSION_POINT_COUNT) {
+    return formatClockFromMinutes(MORNING_SESSION_START_MINUTE + minuteIndex);
+  }
+  return formatClockFromMinutes(AFTERNOON_SESSION_START_MINUTE + (minuteIndex - MORNING_SESSION_POINT_COUNT));
+};
+
+const formatMarketTimeFromDateTimeText = (dateTimeText: string): string => {
+  const minutes = extractMarketMinutesFromDateTimeText(dateTimeText);
+  if (typeof minutes !== "number") return "";
+  return formatClockFromMinutes(minutes);
+};
+
+const getFullTradingVisibleRange = () => ({
+  from: minuteIndexToSyntheticTimestamp(0),
+  to: minuteIndexToSyntheticTimestamp(LAST_TRADING_MINUTE_INDEX),
+});
+
+const formatAxisTimeFromChartTime = (time: Time | undefined): string => {
+  const syntheticTimestamp = getTimestampFromTime(time);
+  if (typeof syntheticTimestamp !== "number") return "";
+  const minuteIndex = syntheticTimestampToMinuteIndex(syntheticTimestamp);
+  if (typeof minuteIndex !== "number") return "";
+
+  if (minuteIndex === 0) return "09:30";
+  if (minuteIndex === 60) return "10:30";
+  if (minuteIndex === 120) return "11:30";
+  if (minuteIndex === MORNING_SESSION_POINT_COUNT + 59 || minuteIndex === MORNING_SESSION_POINT_COUNT + 60) {
+    return "14:00";
+  }
+  if (minuteIndex === LAST_TRADING_MINUTE_INDEX - 1 || minuteIndex === LAST_TRADING_MINUTE_INDEX) {
+    return "15:00";
+  }
+  return "";
 };
 
 const parseEastMoneyDateTimeToTimestamp = (dateTimeText: string): number | null => {
@@ -200,9 +316,11 @@ const parseEastMoneyDateTimeToTimestamp = (dateTimeText: string): number | null 
 };
 
 const formatMarketTimeFromChartTime = (time: Time | undefined): string => {
-  const timestamp = getTimestampFromTime(time);
-  if (typeof timestamp !== "number") return "";
-  return formatMarketTimeFromTimestamp(timestamp);
+  const syntheticTimestamp = getTimestampFromTime(time);
+  if (typeof syntheticTimestamp !== "number") return "";
+  const minuteIndex = syntheticTimestampToMinuteIndex(syntheticTimestamp);
+  if (typeof minuteIndex !== "number") return "";
+  return formatMarketTimeFromMinuteIndex(minuteIndex);
 };
 
 const parseFiniteNumber = (value: string | undefined): number | null => {
@@ -295,124 +413,45 @@ const abortFetch = () => {
   }
 };
 
-const sameSeriesPoint = (a: SeriesPoint, b: SeriesPoint): boolean => a.time === b.time && a.value === b.value;
-
-const isSameRawData = (next: ChartPoint[]): boolean => {
+const isSameRawData = (next: IntradayPoint[]): boolean => {
   const prev = rawData.value;
   if (prev.length !== next.length) return false;
   if (prev.length === 0) return true;
 
   const lastPrev = prev[prev.length - 1];
   const lastNext = next[next.length - 1];
-  if (lastPrev.time !== lastNext.time || lastPrev.value !== lastNext.value) return false;
+  if (lastPrev.realTime !== lastNext.realTime || lastPrev.value !== lastNext.value) return false;
+  if (lastPrev.avgPrice !== lastNext.avgPrice || lastPrev.marketTime !== lastNext.marketTime) return false;
 
   const firstPrev = prev[0];
   const firstNext = next[0];
-  return firstPrev.time === firstNext.time && firstPrev.value === firstNext.value;
+  return (
+    firstPrev.realTime === firstNext.realTime &&
+    firstPrev.value === firstNext.value &&
+    firstPrev.avgPrice === firstNext.avgPrice &&
+    firstPrev.marketTime === firstNext.marketTime
+  );
 };
 
-const applySeriesData = (nextData: SeriesPoint[], forceSetData = false) => {
+const applyFullTradingVisibleRange = () => {
+  if (!chart) return;
+  chart.timeScale().setVisibleRange(getFullTradingVisibleRange());
+  chart.timeScale().setVisibleLogicalRange({
+    from: 0,
+    to: LAST_TRADING_MINUTE_INDEX,
+  });
+};
+
+const applySeriesData = (nextData: SeriesPoint[]) => {
   if (!areaSeries) return;
-  const prevData = appliedSeriesData;
-
-  if (forceSetData || prevData.length === 0) {
-    areaSeries.setData(nextData);
-    appliedSeriesData = nextData.slice();
-    return;
-  }
-
-  if (nextData.length === prevData.length) {
-    let sameTimeStructure = true;
-    for (let i = 0; i < nextData.length; i += 1) {
-      if (nextData[i].time !== prevData[i].time) {
-        sameTimeStructure = false;
-        break;
-      }
-    }
-
-    if (!sameTimeStructure) {
-      areaSeries.setData(nextData);
-      appliedSeriesData = nextData.slice();
-      return;
-    }
-
-    if (nextData.length > 0 && !sameSeriesPoint(nextData[nextData.length - 1], prevData[prevData.length - 1])) {
-      areaSeries.update(nextData[nextData.length - 1]);
-      appliedSeriesData = nextData.slice();
-    }
-    return;
-  }
-
-  if (nextData.length === prevData.length + 1) {
-    let samePrefix = true;
-    for (let i = 0; i < prevData.length; i += 1) {
-      if (!sameSeriesPoint(nextData[i], prevData[i])) {
-        samePrefix = false;
-        break;
-      }
-    }
-
-    if (samePrefix) {
-      areaSeries.update(nextData[nextData.length - 1]);
-      appliedSeriesData = nextData.slice();
-      return;
-    }
-  }
-
   areaSeries.setData(nextData);
-  appliedSeriesData = nextData.slice();
+  applyFullTradingVisibleRange();
 };
 
-const applyAvgSeriesData = (nextData: SeriesPoint[], forceSetData = false) => {
+const applyAvgSeriesData = (nextData: SeriesPoint[]) => {
   if (!avgLineSeries) return;
-  const prevData = appliedAvgSeriesData;
-
-  if (forceSetData || prevData.length === 0) {
-    avgLineSeries.setData(nextData);
-    appliedAvgSeriesData = nextData.slice();
-    return;
-  }
-
-  if (nextData.length === prevData.length) {
-    let sameTimeStructure = true;
-    for (let i = 0; i < nextData.length; i += 1) {
-      if (nextData[i].time !== prevData[i].time) {
-        sameTimeStructure = false;
-        break;
-      }
-    }
-
-    if (!sameTimeStructure) {
-      avgLineSeries.setData(nextData);
-      appliedAvgSeriesData = nextData.slice();
-      return;
-    }
-
-    if (nextData.length > 0 && !sameSeriesPoint(nextData[nextData.length - 1], prevData[prevData.length - 1])) {
-      avgLineSeries.update(nextData[nextData.length - 1]);
-      appliedAvgSeriesData = nextData.slice();
-    }
-    return;
-  }
-
-  if (nextData.length === prevData.length + 1) {
-    let samePrefix = true;
-    for (let i = 0; i < prevData.length; i += 1) {
-      if (!sameSeriesPoint(nextData[i], prevData[i])) {
-        samePrefix = false;
-        break;
-      }
-    }
-
-    if (samePrefix) {
-      avgLineSeries.update(nextData[nextData.length - 1]);
-      appliedAvgSeriesData = nextData.slice();
-      return;
-    }
-  }
-
   avgLineSeries.setData(nextData);
-  appliedAvgSeriesData = nextData.slice();
+  applyFullTradingVisibleRange();
 };
 
 watch(
@@ -463,7 +502,6 @@ const initChart = () => {
   const width = chartContainerRef.value.clientWidth;
   const height = chartContainerRef.value.clientHeight;
   if (width < 100) return;
-  chartWidth.value = Math.floor(width);
 
   chart = createChart(chartContainerRef.value, {
     width,
@@ -514,7 +552,8 @@ const initChart = () => {
       secondsVisible: false,
       fixLeftEdge: true,
       fixRightEdge: true,
-      tickMarkFormatter: (time: Time) => formatMarketTimeFromChartTime(time),
+      rightOffset: 0,
+      tickMarkFormatter: (time: Time) => formatAxisTimeFromChartTime(time),
     },
     handleScroll: { vertTouchDrag: false },
     handleScale: false,
@@ -526,9 +565,8 @@ const initChart = () => {
     for (const entry of entries) {
       const { width: nextWidth, height: nextHeight } = entry.contentRect;
       if (nextWidth > 0) {
-        chartWidth.value = Math.floor(nextWidth);
         chart.applyOptions({ width: nextWidth, height: nextHeight || 120 });
-        chart.timeScale().fitContent();
+        applyFullTradingVisibleRange();
       }
     }
   });
@@ -561,7 +599,7 @@ const initChart = () => {
   lastAppliedTrendColor = trendColor.value;
 
   chart.subscribeCrosshairMove((param) => {
-    if (!areaSeries || !param.point || !param.time) {
+    if (!areaSeries || !param.point || param.time === undefined) {
       hideHover();
       return;
     }
@@ -572,20 +610,20 @@ const initChart = () => {
       return;
     }
 
-    const timestamp = getTimestampFromTime(param.time);
-    if (typeof timestamp !== "number") {
+    const syntheticTimestamp = getTimestampFromTime(param.time);
+    if (typeof syntheticTimestamp !== "number") {
       hideHover();
       return;
     }
 
-    const point = pointIndex.value.get(timestamp);
+    const point = pointIndex.value.get(syntheticTimestamp as UTCTimestamp);
     if (!point || preClosePrice.value <= 0) {
       hideHover();
       return;
     }
 
     hoverInfo.value = {
-      time: formatMarketTimeFromTimestamp(point.time),
+      time: point.marketTime,
       price: point.value,
       avgPrice: point.avgPrice,
       percent: ((point.value - preClosePrice.value) / preClosePrice.value) * 100,
@@ -601,9 +639,9 @@ const initChart = () => {
   });
 
   chartContainerRef.value.addEventListener("mouseleave", hideHover);
-  applySeriesData(sampledSeriesData.value, true);
-  applyAvgSeriesData(sampledAvgSeriesData.value, true);
-  chart.timeScale().fitContent();
+  applySeriesData(seriesData.value);
+  applyAvgSeriesData(avgSeriesData.value);
+  applyFullTradingVisibleRange();
 };
 
 const fetchIntradayData = async () => {
@@ -627,7 +665,7 @@ const fetchIntradayData = async () => {
     const preClose = Number(result.data.preClose) || 0;
     preClosePrice.value = preClose;
 
-    const parsedData: IntradayPoint[] = [];
+    const parsedDataByMinute = new Map<number, IntradayPoint>();
     let currentPrice = 0;
 
     for (const item of trends) {
@@ -641,10 +679,21 @@ const fetchIntradayData = async () => {
       const timestamp = parseEastMoneyDateTimeToTimestamp(timeStr);
       if (typeof timestamp !== "number") continue;
 
-      parsedData.push({ time: timestamp, value: price, avgPrice });
+      const minuteIndex = dateTimeTextToTradingMinuteIndex(timeStr) ?? timestampToTradingMinuteIndex(timestamp);
+      if (typeof minuteIndex !== "number") continue;
+
+      parsedDataByMinute.set(minuteIndex, {
+        time: minuteIndexToSyntheticTimestamp(minuteIndex),
+        realTime: timestamp,
+        marketTime: formatMarketTimeFromDateTimeText(timeStr) || formatMarketTimeFromMinuteIndex(minuteIndex),
+        minuteIndex,
+        value: price,
+        avgPrice,
+      });
       currentPrice = price;
     }
 
+    const parsedData = Array.from(parsedDataByMinute.values()).sort((a, b) => a.minuteIndex - b.minuteIndex);
     if (!isSameRawData(parsedData)) {
       rawData.value = parsedData;
     }
@@ -691,11 +740,11 @@ watch(isExpanded, async (expanded) => {
   requestAnimationFrame(initChart);
 });
 
-watch(sampledSeriesData, (nextData) => {
+watch(seriesData, (nextData) => {
   applySeriesData(nextData);
 });
 
-watch(sampledAvgSeriesData, (nextData) => {
+watch(avgSeriesData, (nextData) => {
   applyAvgSeriesData(nextData);
 });
 
@@ -722,8 +771,6 @@ onUnmounted(() => {
 
   areaSeries = null;
   avgLineSeries = null;
-  appliedSeriesData = [];
-  appliedAvgSeriesData = [];
   lastAppliedTrendColor = "";
 });
 </script>
