@@ -79,7 +79,7 @@ interface IntradayPoint extends ChartPoint {
   avgPrice: number;
 }
 
-const STOCK_CODE = "0.002565";
+const STOCK_CODE = "0.002361";
 const MARKET_TIME_ZONE = "Asia/Shanghai";
 const MARKET_UTC_OFFSET_HOURS = 8;
 const TRADING_POLL_INTERVAL_MS = 1000 * 3;
@@ -765,12 +765,10 @@ onUnmounted(() => {
 }
 
 .stock-card {
-  width: 180px;
-  height: 60px;
-  background: #fff;
-  border: 1px solid #e0e0e0;
+  width: 140px;
+  height: 40px;
+  background: transparent;
   border-radius: 12px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
   cursor: pointer;
   overflow: hidden;
   transition: all 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
@@ -781,32 +779,26 @@ onUnmounted(() => {
 .stock-card.is-expanded {
   height: 300px;
   width: 400px;
-  background: #fafafa;
-}
-
-.stock-card:hover {
-  border-color: #b0b0b0;
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+  background: rgba(255, 255, 255, 0.7);
 }
 
 .minimal-content {
-  height: 60px;
-  min-height: 60px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 16px;
+  padding: 8px;
+  font-size: 12px;
 }
 
 .stock-name {
-  font-size: 14px;
+  font-size: 12px;
   font-weight: 600;
   color: #333;
 }
 
 .stock-percent {
-  font-size: 14px;
-  font-weight: 700;
+  font-size: 12px;
+  font-weight: 600;
   padding: 4px 8px;
   border-radius: 4px;
   transition: color 0.3s ease;
