@@ -22,10 +22,12 @@ export default defineManifest({
   permissions: [
     'sidePanel',
     'contentSettings',
+    'storage',
   ],
   host_permissions: [
     'http://push2.eastmoney.com/*',
     'https://push2.eastmoney.com/*',
+    'https://searchapi.eastmoney.com/*',
   ],
   side_panel: {
     default_path: 'src/sidepanel/index.html',

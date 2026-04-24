@@ -1,5 +1,5 @@
 ﻿<template>
-  <div class="stock-widget-container">
+  <div v-if="stockConfig.enabled" class="stock-widget-container" :style="widgetPositionStyle">
     <div class="stock-card" :class="{ 'is-expanded': isExpanded }" @click="isExpanded = !isExpanded">
       <div class="minimal-content">
         <span class="stock-name">{{ stockData.name }}</span>
@@ -47,7 +47,14 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import {
-  AreaSeries,
+  DEFAULT_STOCK_CONFIG,
+  getStockConfig,
+  normalizeStockConfig,
+  saveStockConfig,
+  STOCK_CONFIG_STORAGE_KEY,
+  type StockConfig,
+} from "@/shared/stockConfig";
+import {
   ColorType,
   createChart,
   CrosshairMode,
@@ -83,7 +90,6 @@ interface IntradayPoint {
   avgPrice: number;
 }
 
-const STOCK_CODE = "0.002361";
 const MARKET_TIME_ZONE = "Asia/Shanghai";
 const MARKET_UTC_OFFSET_HOURS = 8;
 const MORNING_SESSION_START_MINUTE = 9 * 60 + 30;
@@ -91,17 +97,14 @@ const MORNING_SESSION_END_MINUTE = 11 * 60 + 30;
 const AFTERNOON_SESSION_START_MINUTE = 13 * 60;
 const AFTERNOON_SESSION_END_MINUTE = 15 * 60;
 const MORNING_SESSION_POINT_COUNT = MORNING_SESSION_END_MINUTE - MORNING_SESSION_START_MINUTE + 1;
-const TOTAL_TRADING_POINT_COUNT =
-  MORNING_SESSION_POINT_COUNT + (AFTERNOON_SESSION_END_MINUTE - AFTERNOON_SESSION_START_MINUTE + 1);
-const LAST_TRADING_MINUTE_INDEX = TOTAL_TRADING_POINT_COUNT - 1;
-const SYNTHETIC_TIME_BASE_SECONDS = 0;
-const TRADING_POLL_INTERVAL_MS = 1000 * 3;
+const LAST_TRADING_MINUTE_INDEX = 240;
 const OFF_HOURS_POLL_INTERVAL_MS = 1000 * 60 * 2;
 const HIDDEN_POLL_INTERVAL_MS = 1000 * 60 * 3;
 
-type SeriesPoint = { time: UTCTimestamp; value?: number };
+type SeriesPoint = { time: UTCTimestamp; value: number };
 
-const isExpanded = ref(false);
+const stockConfig = ref<StockConfig>(DEFAULT_STOCK_CONFIG);
+const isExpanded = ref(DEFAULT_STOCK_CONFIG.defaultExpanded);
 const shouldFlash = ref(false);
 const chartContainerRef = ref<HTMLDivElement | null>(null);
 const tooltipRef = ref<HTMLDivElement | null>(null);
@@ -117,8 +120,7 @@ const stockData = ref<Stock>({
 });
 
 let chart: IChartApi | null = null;
-let areaSeries: ISeriesApi<"Area"> | null = null;
-let avgLineSeries: ISeriesApi<"Line"> | null = null;
+let priceLineSeries: ISeriesApi<"Line"> | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let pollingTimer: ReturnType<typeof setTimeout> | null = null;
 let fetchController: AbortController | null = null;
@@ -127,6 +129,10 @@ let lastAppliedTrendColor = "";
 
 const trendClass = computed(() => (stockData.value.percent >= 0 ? "up" : "down"));
 const trendColor = computed(() => (stockData.value.percent >= 0 ? "#f23645" : "#089981"));
+const widgetPositionStyle = computed(() => ({
+  top: `${stockConfig.value.position.top}px`,
+  right: `${stockConfig.value.position.right}px`,
+}));
 
 const latestTime = computed(() => {
   const lastPoint = rawData.value[rawData.value.length - 1];
@@ -148,33 +154,12 @@ const seriesData = computed<SeriesPoint[]>(() => {
   const data: SeriesPoint[] = [];
   for (let minuteIndex = 0; minuteIndex <= LAST_TRADING_MINUTE_INDEX; minuteIndex += 1) {
     const point = pointByMinuteIndex.value.get(minuteIndex);
-    data.push(
-      point
-        ? {
-            time: point.time,
-            value: point.value,
-          }
-        : {
-            time: minuteIndexToSyntheticTimestamp(minuteIndex),
-          },
-    );
-  }
-  return data;
-});
-const avgSeriesData = computed<SeriesPoint[]>(() => {
-  const data: SeriesPoint[] = [];
-  for (let minuteIndex = 0; minuteIndex <= LAST_TRADING_MINUTE_INDEX; minuteIndex += 1) {
-    const point = pointByMinuteIndex.value.get(minuteIndex);
-    data.push(
-      point
-        ? {
-            time: point.time,
-            value: point.avgPrice,
-          }
-        : {
-            time: minuteIndexToSyntheticTimestamp(minuteIndex),
-          },
-    );
+    if (point) {
+      data.push({
+        time: point.time,
+        value: point.value,
+      });
+    }
   }
   return data;
 });
@@ -196,11 +181,11 @@ const getTimestampFromTime = (time: Time | undefined): number | null => {
 };
 
 const minuteIndexToSyntheticTimestamp = (minuteIndex: number): UTCTimestamp => {
-  return (SYNTHETIC_TIME_BASE_SECONDS + minuteIndex * 60) as UTCTimestamp;
+  return minuteIndex as UTCTimestamp;
 };
 
 const syntheticTimestampToMinuteIndex = (timestamp: number): number | null => {
-  const minuteIndex = Math.round((timestamp - SYNTHETIC_TIME_BASE_SECONDS) / 60);
+  const minuteIndex = Math.round(timestamp);
   if (!Number.isInteger(minuteIndex)) return null;
   if (minuteIndex < 0 || minuteIndex > LAST_TRADING_MINUTE_INDEX) return null;
   return minuteIndex;
@@ -217,7 +202,10 @@ const shanghaiMinutesToTradingMinuteIndex = (minutes: number): number | null => 
   }
 
   if (minutes >= AFTERNOON_SESSION_START_MINUTE && minutes <= AFTERNOON_SESSION_END_MINUTE) {
-    return MORNING_SESSION_POINT_COUNT + (minutes - AFTERNOON_SESSION_START_MINUTE);
+    if (minutes === AFTERNOON_SESSION_END_MINUTE) return LAST_TRADING_MINUTE_INDEX;
+
+    const minuteIndex = MORNING_SESSION_POINT_COUNT + (minutes - AFTERNOON_SESSION_START_MINUTE);
+    return minuteIndex <= LAST_TRADING_MINUTE_INDEX ? minuteIndex : null;
   }
 
   return null;
@@ -255,6 +243,7 @@ const formatClockFromMinutes = (minutes: number): string => {
 
 const formatMarketTimeFromMinuteIndex = (minuteIndex: number): string => {
   if (minuteIndex < 0 || minuteIndex > LAST_TRADING_MINUTE_INDEX) return "";
+  if (minuteIndex === LAST_TRADING_MINUTE_INDEX) return "15:00";
   if (minuteIndex < MORNING_SESSION_POINT_COUNT) {
     return formatClockFromMinutes(MORNING_SESSION_START_MINUTE + minuteIndex);
   }
@@ -284,7 +273,7 @@ const formatAxisTimeFromChartTime = (time: Time | undefined): string => {
   if (minuteIndex === MORNING_SESSION_POINT_COUNT + 59 || minuteIndex === MORNING_SESSION_POINT_COUNT + 60) {
     return "14:00";
   }
-  if (minuteIndex === LAST_TRADING_MINUTE_INDEX - 1 || minuteIndex === LAST_TRADING_MINUTE_INDEX) {
+  if (minuteIndex === LAST_TRADING_MINUTE_INDEX) {
     return "15:00";
   }
   return "";
@@ -368,7 +357,7 @@ const isTradingSessionNow = (): boolean => {
 
 const getNextPollInterval = (): number => {
   if (document.hidden) return HIDDEN_POLL_INTERVAL_MS;
-  return isTradingSessionNow() ? TRADING_POLL_INTERVAL_MS : OFF_HOURS_POLL_INTERVAL_MS;
+  return isTradingSessionNow() ? stockConfig.value.tradingPollIntervalMs : OFF_HOURS_POLL_INTERVAL_MS;
 };
 
 const clearPollingTimer = () => {
@@ -379,7 +368,7 @@ const clearPollingTimer = () => {
 };
 
 const scheduleNextPoll = () => {
-  if (!isMounted) return;
+  if (!isMounted || !stockConfig.value.enabled) return;
 
   clearPollingTimer();
   pollingTimer = setTimeout(() => {
@@ -388,7 +377,7 @@ const scheduleNextPoll = () => {
 };
 
 const runPollingCycle = async () => {
-  if (!isMounted) return;
+  if (!isMounted || !stockConfig.value.enabled) return;
 
   await fetchIntradayData();
   scheduleNextPoll();
@@ -398,6 +387,7 @@ const refreshPollingSchedule = () => {
   if (!isMounted) return;
 
   clearPollingTimer();
+  if (!stockConfig.value.enabled) return;
   if (document.hidden) {
     scheduleNextPoll();
     return;
@@ -436,22 +426,115 @@ const isSameRawData = (next: IntradayPoint[]): boolean => {
 const applyFullTradingVisibleRange = () => {
   if (!chart) return;
   chart.timeScale().setVisibleRange(getFullTradingVisibleRange());
-  chart.timeScale().setVisibleLogicalRange({
-    from: 0,
-    to: LAST_TRADING_MINUTE_INDEX,
-  });
 };
 
 const applySeriesData = (nextData: SeriesPoint[]) => {
-  if (!areaSeries) return;
-  areaSeries.setData(nextData);
+  if (!priceLineSeries) return;
+  priceLineSeries.setData(nextData);
   applyFullTradingVisibleRange();
 };
 
-const applyAvgSeriesData = (nextData: SeriesPoint[]) => {
-  if (!avgLineSeries) return;
-  avgLineSeries.setData(nextData);
+const isSamePoint = (prev: IntradayPoint, next: IntradayPoint): boolean => {
+  return (
+    prev.time === next.time &&
+    prev.realTime === next.realTime &&
+    prev.value === next.value &&
+    prev.avgPrice === next.avgPrice &&
+    prev.marketTime === next.marketTime
+  );
+};
+
+const shouldResetPriceSeries = (prev: IntradayPoint[], next: IntradayPoint[]): boolean => {
+  if (!priceLineSeries) return false;
+  if (prev.length === 0) return true;
+  if (next.length < prev.length) return true;
+  if (!next[0] || !isSamePoint(prev[0], next[0])) return true;
+
+  for (let index = 1; index < prev.length; index += 1) {
+    if (!next[index]) return true;
+    if (next[index].time !== prev[index].time || next[index].minuteIndex !== prev[index].minuteIndex) return true;
+  }
+
+  return false;
+};
+
+const syncPriceSeriesData = (prev: IntradayPoint[], next: IntradayPoint[]) => {
+  if (!priceLineSeries) return;
+
+  if (shouldResetPriceSeries(prev, next)) {
+    applySeriesData(next.map((point) => ({ time: point.time, value: point.value })));
+    return;
+  }
+
+  const firstChangedIndex = next.findIndex((point, index) => !prev[index] || !isSamePoint(prev[index], point));
+  if (firstChangedIndex === -1) return;
+
+  for (let index = firstChangedIndex; index < next.length; index += 1) {
+    const point = next[index];
+    priceLineSeries.update({
+      time: point.time,
+      value: point.value,
+    });
+  }
+
   applyFullTradingVisibleRange();
+};
+
+const resetStockState = () => {
+  rawData.value = [];
+  hoverInfo.value = null;
+  preClosePrice.value = 0;
+  stockData.value = {
+    name: stockConfig.value.name || "加载中...",
+    price: 0,
+    percent: 0,
+  };
+  applySeriesData([]);
+};
+
+const applyStockConfig = (nextConfig: Partial<StockConfig> | undefined) => {
+  const normalizedConfig = normalizeStockConfig(nextConfig);
+  const stockChanged = normalizedConfig.secid !== stockConfig.value.secid;
+  const enabledChanged = normalizedConfig.enabled !== stockConfig.value.enabled;
+  const pollIntervalChanged = normalizedConfig.tradingPollIntervalMs !== stockConfig.value.tradingPollIntervalMs;
+
+  stockConfig.value = normalizedConfig;
+
+  if (normalizedConfig.defaultExpanded && !isExpanded.value) {
+    isExpanded.value = true;
+  }
+
+  if (stockChanged) {
+    abortFetch();
+    resetStockState();
+  }
+
+  if (enabledChanged && !normalizedConfig.enabled) {
+    clearPollingTimer();
+    return;
+  }
+
+  if (stockChanged || enabledChanged || pollIntervalChanged) {
+    refreshPollingSchedule();
+  }
+};
+
+const handleStockConfigStorageChange = (changes: Record<string, chrome.storage.StorageChange>, areaName: string) => {
+  if (areaName !== "sync") return;
+
+  const nextValue = changes[STOCK_CONFIG_STORAGE_KEY]?.newValue as Partial<StockConfig> | undefined;
+  if (!nextValue) return;
+
+  applyStockConfig(nextValue);
+};
+
+const handleRuntimeMessage = (message: { type?: string }) => {
+  if (message.type !== "TOGGLE_FEATURE") return;
+
+  void saveStockConfig({
+    ...stockConfig.value,
+    enabled: !stockConfig.value.enabled,
+  });
 };
 
 watch(
@@ -497,7 +580,7 @@ const initChart = () => {
   if (!isMounted || !isExpanded.value) return;
   if (!chartContainerRef.value) return;
 
-  if (chart && areaSeries) return;
+  if (chart && priceLineSeries) return;
 
   const width = chartContainerRef.value.clientWidth;
   const height = chartContainerRef.value.clientHeight;
@@ -572,11 +655,9 @@ const initChart = () => {
   });
   resizeObserver.observe(chartContainerRef.value);
 
-  areaSeries = chart.addSeries(AreaSeries, {
-    lineColor: trendColor.value,
-    topColor: `${trendColor.value}4D`,
-    bottomColor: `${trendColor.value}00`,
-    lineWidth: 1,
+  priceLineSeries = chart.addSeries(LineSeries, {
+    color: trendColor.value,
+    lineWidth: 2,
     priceFormat: {
       type: "custom",
       minMove: 0.01,
@@ -589,22 +670,15 @@ const initChart = () => {
     crosshairMarkerBorderColor: "#fff",
     crosshairMarkerBorderWidth: 2,
   });
-  avgLineSeries = chart.addSeries(LineSeries, {
-    color: "#f5a623",
-    lineWidth: 1,
-    priceLineVisible: false,
-    lastValueVisible: false,
-    crosshairMarkerVisible: false,
-  });
   lastAppliedTrendColor = trendColor.value;
 
   chart.subscribeCrosshairMove((param) => {
-    if (!areaSeries || !param.point || param.time === undefined) {
+    if (!priceLineSeries || !param.point || param.time === undefined) {
       hideHover();
       return;
     }
 
-    const priceData = param.seriesData.get(areaSeries) as { value?: number } | undefined;
+    const priceData = param.seriesData.get(priceLineSeries) as { value?: number } | undefined;
     if (!priceData || typeof priceData.value !== "number") {
       hideHover();
       return;
@@ -640,18 +714,18 @@ const initChart = () => {
 
   chartContainerRef.value.addEventListener("mouseleave", hideHover);
   applySeriesData(seriesData.value);
-  applyAvgSeriesData(avgSeriesData.value);
   applyFullTradingVisibleRange();
 };
 
 const fetchIntradayData = async () => {
-  if (isFetching.value) return;
+  if (isFetching.value || !stockConfig.value.enabled) return;
   isFetching.value = true;
   fetchController = new AbortController();
+  const stockSecid = stockConfig.value.secid;
 
   try {
     const response = await fetch(
-      `https://push2.eastmoney.com/api/qt/stock/trends2/get?secid=${STOCK_CODE}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&fields2=f51,f52,f53,f54,f55,f56,f57,f58&ut=fa5fd1943c7b386f172d6893dbfba10b&ndays=1&iscr=0&iscca=0`,
+      `https://push2.eastmoney.com/api/qt/stock/trends2/get?secid=${stockSecid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&fields2=f51,f52,f53,f54,f55,f56,f57,f58&ut=fa5fd1943c7b386f172d6893dbfba10b&ndays=1&iscr=0&iscca=0`,
       {
         headers: { "Cache-Control": "no-cache" },
         signal: fetchController.signal,
@@ -694,8 +768,10 @@ const fetchIntradayData = async () => {
     }
 
     const parsedData = Array.from(parsedDataByMinute.values()).sort((a, b) => a.minuteIndex - b.minuteIndex);
+    const previousData = rawData.value;
     if (!isSameRawData(parsedData)) {
       rawData.value = parsedData;
+      syncPriceSeriesData(previousData, parsedData);
     }
 
     if (result.data.name) {
@@ -707,13 +783,11 @@ const fetchIntradayData = async () => {
       stockData.value.percent = ((currentPrice - preClose) / preClose) * 100;
     }
 
-    if (!areaSeries) return;
+    if (!priceLineSeries) return;
     const nextTrendColor = trendColor.value;
     if (nextTrendColor !== lastAppliedTrendColor) {
-      areaSeries.applyOptions({
-        lineColor: nextTrendColor,
-        topColor: `${nextTrendColor}4D`,
-        bottomColor: `${nextTrendColor}00`,
+      priceLineSeries.applyOptions({
+        color: nextTrendColor,
       });
       lastAppliedTrendColor = nextTrendColor;
     }
@@ -727,10 +801,21 @@ const fetchIntradayData = async () => {
 };
 
 onMounted(async () => {
+  stockConfig.value = await getStockConfig();
+  isExpanded.value = stockConfig.value.defaultExpanded;
+  resetStockState();
+
   await nextTick();
   isMounted = true;
   document.addEventListener("visibilitychange", refreshPollingSchedule);
+  if (typeof chrome !== "undefined") {
+    chrome.storage?.onChanged?.addListener(handleStockConfigStorageChange);
+    chrome.runtime?.onMessage?.addListener(handleRuntimeMessage);
+  }
   void runPollingCycle();
+  if (isExpanded.value) {
+    requestAnimationFrame(initChart);
+  }
 });
 
 watch(isExpanded, async (expanded) => {
@@ -740,17 +825,13 @@ watch(isExpanded, async (expanded) => {
   requestAnimationFrame(initChart);
 });
 
-watch(seriesData, (nextData) => {
-  applySeriesData(nextData);
-});
-
-watch(avgSeriesData, (nextData) => {
-  applyAvgSeriesData(nextData);
-});
-
 onUnmounted(() => {
   isMounted = false;
   document.removeEventListener("visibilitychange", refreshPollingSchedule);
+  if (typeof chrome !== "undefined") {
+    chrome.storage?.onChanged?.removeListener(handleStockConfigStorageChange);
+    chrome.runtime?.onMessage?.removeListener(handleRuntimeMessage);
+  }
 
   if (chartContainerRef.value) {
     chartContainerRef.value.removeEventListener("mouseleave", hideHover);
@@ -769,8 +850,7 @@ onUnmounted(() => {
     chart = null;
   }
 
-  areaSeries = null;
-  avgLineSeries = null;
+  priceLineSeries = null;
   lastAppliedTrendColor = "";
 });
 </script>
