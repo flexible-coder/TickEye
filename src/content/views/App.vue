@@ -61,9 +61,12 @@ import {
   LineSeries,
   LineStyle,
   type IChartApi,
+  type IPriceLine,
   type ISeriesApi,
+  type LineData,
   type Time,
   type UTCTimestamp,
+  type WhitespaceData,
 } from "lightweight-charts";
 
 interface Stock {
@@ -98,10 +101,11 @@ const AFTERNOON_SESSION_START_MINUTE = 13 * 60;
 const AFTERNOON_SESSION_END_MINUTE = 15 * 60;
 const MORNING_SESSION_POINT_COUNT = MORNING_SESSION_END_MINUTE - MORNING_SESSION_START_MINUTE + 1;
 const LAST_TRADING_MINUTE_INDEX = 240;
+const TIME_SCALE_EDGE_PADDING_BARS = 8;
 const OFF_HOURS_POLL_INTERVAL_MS = 1000 * 60 * 2;
 const HIDDEN_POLL_INTERVAL_MS = 1000 * 60 * 3;
 
-type SeriesPoint = { time: UTCTimestamp; value: number };
+type SeriesPoint = LineData<UTCTimestamp> | WhitespaceData<UTCTimestamp>;
 
 const stockConfig = ref<StockConfig>(DEFAULT_STOCK_CONFIG);
 const isExpanded = ref(DEFAULT_STOCK_CONFIG.defaultExpanded);
@@ -121,11 +125,14 @@ const stockData = ref<Stock>({
 
 let chart: IChartApi | null = null;
 let priceLineSeries: ISeriesApi<"Line"> | null = null;
+let preClosePriceLine: IPriceLine | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let pollingTimer: ReturnType<typeof setTimeout> | null = null;
 let fetchController: AbortController | null = null;
 let isMounted = false;
 let lastAppliedTrendColor = "";
+
+const fullTradingMinuteIndexes = Array.from({ length: LAST_TRADING_MINUTE_INDEX + 1 }, (_, minuteIndex) => minuteIndex);
 
 const trendClass = computed(() => (stockData.value.percent >= 0 ? "up" : "down"));
 const trendColor = computed(() => (stockData.value.percent >= 0 ? "#f23645" : "#089981"));
@@ -149,20 +156,17 @@ const hoverPercentText = computed(() => {
   return `${hoverInfo.value.percent > 0 ? "+" : ""}${hoverInfo.value.percent.toFixed(2)}%`;
 });
 
-const pointByMinuteIndex = computed(() => new Map(rawData.value.map((point) => [point.minuteIndex, point])));
-const seriesData = computed<SeriesPoint[]>(() => {
-  const data: SeriesPoint[] = [];
-  for (let minuteIndex = 0; minuteIndex <= LAST_TRADING_MINUTE_INDEX; minuteIndex += 1) {
-    const point = pointByMinuteIndex.value.get(minuteIndex);
-    if (point) {
-      data.push({
-        time: point.time,
-        value: point.value,
-      });
-    }
-  }
-  return data;
-});
+const buildFullTradingSeriesData = (points: IntradayPoint[]): SeriesPoint[] => {
+  const pointByMinuteIndex = new Map(points.map((point) => [point.minuteIndex, point]));
+
+  return fullTradingMinuteIndexes.map((minuteIndex) => {
+    const time = minuteIndexToSyntheticTimestamp(minuteIndex);
+    const point = pointByMinuteIndex.get(minuteIndex);
+    return point ? { time, value: point.value } : { time };
+  });
+};
+
+const seriesData = computed<SeriesPoint[]>(() => buildFullTradingSeriesData(rawData.value));
 const pointIndex = computed(() => new Map(rawData.value.map((point) => [point.time, point])));
 
 const formatPriceAsPercent = (price: number): string => {
@@ -256,9 +260,10 @@ const formatMarketTimeFromDateTimeText = (dateTimeText: string): string => {
   return formatClockFromMinutes(minutes);
 };
 
-const getFullTradingVisibleRange = () => ({
-  from: minuteIndexToSyntheticTimestamp(0),
-  to: minuteIndexToSyntheticTimestamp(LAST_TRADING_MINUTE_INDEX),
+const getFullTradingVisibleLogicalRange = () => ({
+  // from: -TIME_SCALE_EDGE_PADDING_BARS,
+  from: 0,
+  to: LAST_TRADING_MINUTE_INDEX + TIME_SCALE_EDGE_PADDING_BARS,
 });
 
 const formatAxisTimeFromChartTime = (time: Time | undefined): string => {
@@ -268,11 +273,11 @@ const formatAxisTimeFromChartTime = (time: Time | undefined): string => {
   if (typeof minuteIndex !== "number") return "";
 
   if (minuteIndex === 0) return "09:30";
-  if (minuteIndex === 60) return "10:30";
+  // if (minuteIndex === 60) return "10:30";
   if (minuteIndex === 120) return "11:30";
-  if (minuteIndex === MORNING_SESSION_POINT_COUNT + 59 || minuteIndex === MORNING_SESSION_POINT_COUNT + 60) {
-    return "14:00";
-  }
+  // if (minuteIndex === MORNING_SESSION_POINT_COUNT + 59 || minuteIndex === MORNING_SESSION_POINT_COUNT + 60) {
+  //   return "14:00";
+  // }
   if (minuteIndex === LAST_TRADING_MINUTE_INDEX) {
     return "15:00";
   }
@@ -423,9 +428,41 @@ const isSameRawData = (next: IntradayPoint[]): boolean => {
   );
 };
 
+const syncPreClosePriceLine = () => {
+  if (!priceLineSeries) return;
+
+  if (preClosePrice.value <= 0) {
+    if (preClosePriceLine) {
+      priceLineSeries.removePriceLine(preClosePriceLine);
+      preClosePriceLine = null;
+    }
+    return;
+  }
+
+  const options = {
+    price: preClosePrice.value,
+    color: "rgba(0, 0, 0, 0.26)",
+    lineWidth: 2,
+    lineStyle: LineStyle.Dotted,
+    lineVisible: true,
+    axisLabelVisible: false,
+    title: "",
+    axisLabelColor: "rgba(117, 134, 150, 0.9)",
+    axisLabelTextColor: "#fff",
+  } as const;
+
+  if (preClosePriceLine) {
+    preClosePriceLine.applyOptions(options);
+    return;
+  }
+
+  preClosePriceLine = priceLineSeries.createPriceLine(options);
+};
+
 const applyFullTradingVisibleRange = () => {
   if (!chart) return;
-  chart.timeScale().setVisibleRange(getFullTradingVisibleRange());
+  chart.timeScale().fitContent();
+  chart.timeScale().setVisibleLogicalRange(getFullTradingVisibleLogicalRange());
 };
 
 const applySeriesData = (nextData: SeriesPoint[]) => {
@@ -434,50 +471,9 @@ const applySeriesData = (nextData: SeriesPoint[]) => {
   applyFullTradingVisibleRange();
 };
 
-const isSamePoint = (prev: IntradayPoint, next: IntradayPoint): boolean => {
-  return (
-    prev.time === next.time &&
-    prev.realTime === next.realTime &&
-    prev.value === next.value &&
-    prev.avgPrice === next.avgPrice &&
-    prev.marketTime === next.marketTime
-  );
-};
-
-const shouldResetPriceSeries = (prev: IntradayPoint[], next: IntradayPoint[]): boolean => {
-  if (!priceLineSeries) return false;
-  if (prev.length === 0) return true;
-  if (next.length < prev.length) return true;
-  if (!next[0] || !isSamePoint(prev[0], next[0])) return true;
-
-  for (let index = 1; index < prev.length; index += 1) {
-    if (!next[index]) return true;
-    if (next[index].time !== prev[index].time || next[index].minuteIndex !== prev[index].minuteIndex) return true;
-  }
-
-  return false;
-};
-
-const syncPriceSeriesData = (prev: IntradayPoint[], next: IntradayPoint[]) => {
+const syncPriceSeriesData = (next: IntradayPoint[]) => {
   if (!priceLineSeries) return;
-
-  if (shouldResetPriceSeries(prev, next)) {
-    applySeriesData(next.map((point) => ({ time: point.time, value: point.value })));
-    return;
-  }
-
-  const firstChangedIndex = next.findIndex((point, index) => !prev[index] || !isSamePoint(prev[index], point));
-  if (firstChangedIndex === -1) return;
-
-  for (let index = firstChangedIndex; index < next.length; index += 1) {
-    const point = next[index];
-    priceLineSeries.update({
-      time: point.time,
-      value: point.value,
-    });
-  }
-
-  applyFullTradingVisibleRange();
+  applySeriesData(buildFullTradingSeriesData(next));
 };
 
 const resetStockState = () => {
@@ -489,7 +485,8 @@ const resetStockState = () => {
     price: 0,
     percent: 0,
   };
-  applySeriesData([]);
+  syncPreClosePriceLine();
+  applySeriesData(buildFullTradingSeriesData([]));
 };
 
 const applyStockConfig = (nextConfig: Partial<StockConfig> | undefined) => {
@@ -600,8 +597,8 @@ const initChart = () => {
       timeFormatter: (time: Time) => formatMarketTimeFromChartTime(time),
     },
     grid: {
-      vertLines: { visible: false },
-      horzLines: { visible: true, color: "rgba(0,0,0,0.05)", style: LineStyle.Dotted },
+      vertLines: { visible: true, color: "rgba(0,0,0,0.1)", style: LineStyle.Dotted },
+      horzLines: { visible: true, color: "rgba(0,0,0,0.1)", style: LineStyle.Dotted },
     },
     crosshair: {
       mode: CrosshairMode.Normal,
@@ -609,18 +606,18 @@ const initChart = () => {
         color: "#758696",
         width: 1,
         style: LineStyle.Dashed,
-        labelBackgroundColor: "#758696",
+        labelBackgroundColor: "#666",
       },
       horzLine: {
         color: "#758696",
         width: 1,
         style: LineStyle.Dashed,
-        labelBackgroundColor: "#758696",
+        labelBackgroundColor: "#666",
       },
     },
     rightPriceScale: {
-      visible: true,
-      borderVisible: false,
+      borderColor: "rgba(0,0,0,0.1)",
+      borderVisible: true,
       ensureEdgeTickMarksVisible: true,
       entireTextOnly: false,
       scaleMargins: {
@@ -629,13 +626,14 @@ const initChart = () => {
       },
     },
     timeScale: {
-      visible: true,
-      borderVisible: false,
-      timeVisible: true,
-      secondsVisible: false,
+      barSpacing:0,
+      borderColor: "rgba(0,0,0,0.1)",
+      timeVisible:true,
       fixLeftEdge: true,
-      fixRightEdge: true,
-      rightOffset: 0,
+      // fixRightEdge: true,
+      secondsVisible: false,
+      ticksVisible:false,
+      // tickMarkMaxCharacterLength :5,
       tickMarkFormatter: (time: Time) => formatAxisTimeFromChartTime(time),
     },
     handleScroll: { vertTouchDrag: false },
@@ -670,6 +668,7 @@ const initChart = () => {
     crosshairMarkerBorderColor: "#fff",
     crosshairMarkerBorderWidth: 2,
   });
+  syncPreClosePriceLine();
   lastAppliedTrendColor = trendColor.value;
 
   chart.subscribeCrosshairMove((param) => {
@@ -738,11 +737,12 @@ const fetchIntradayData = async () => {
     const trends = result.data.trends as string[];
     const preClose = Number(result.data.preClose) || 0;
     preClosePrice.value = preClose;
+    syncPreClosePriceLine();
 
     const parsedDataByMinute = new Map<number, IntradayPoint>();
     let currentPrice = 0;
 
-    for (const item of trends) {
+    for (const item of trends.slice(0,50)) {
       const fields = item.split(",");
       const timeStr = fields[0];
       const price = getTrendPrice(fields) ?? 0;
@@ -768,10 +768,9 @@ const fetchIntradayData = async () => {
     }
 
     const parsedData = Array.from(parsedDataByMinute.values()).sort((a, b) => a.minuteIndex - b.minuteIndex);
-    const previousData = rawData.value;
     if (!isSameRawData(parsedData)) {
       rawData.value = parsedData;
-      syncPriceSeriesData(previousData, parsedData);
+      syncPriceSeriesData(parsedData);
     }
 
     if (result.data.name) {
@@ -851,6 +850,7 @@ onUnmounted(() => {
   }
 
   priceLineSeries = null;
+  preClosePriceLine = null;
   lastAppliedTrendColor = "";
 });
 </script>
@@ -904,9 +904,9 @@ onUnmounted(() => {
 }
 
 .stock-card.is-expanded {
-  height: 300px;
-  width: 400px;
-  background: rgba(255, 255, 255, 0.7);
+  height: max-content;
+  width: 450px;
+  background: rgba(255, 255, 255, 1);
 }
 
 .minimal-content {
@@ -1028,7 +1028,7 @@ onUnmounted(() => {
 }
 
 .chart-container {
-  height: 180px;
+  height: 250px;
   width: 100%;
   background: rgba(0, 0, 0, 0.02);
   border-radius: 4px;
