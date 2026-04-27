@@ -742,7 +742,7 @@ const fetchIntradayData = async () => {
     const parsedDataByMinute = new Map<number, IntradayPoint>();
     let currentPrice = 0;
 
-    for (const item of trends.slice(0,50)) {
+    for (const item of trends) {
       const fields = item.split(",");
       const timeStr = fields[0];
       const price = getTrendPrice(fields) ?? 0;
