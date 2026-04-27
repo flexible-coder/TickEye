@@ -99,6 +99,8 @@ const applyStock = async (stock: Pick<StockConfig, "secid" | "code" | "name">) =
 };
 
 const handleSearch = async (keyword: string) => {
+  console.log('AAAAAAAAA');
+  
   searchText.value = keyword;
 
   const trimmed = keyword.trim();
@@ -148,7 +150,8 @@ const handleSelect = (value: string) => {
   void applyStock(stock);
 };
 
-const applyCurrentInput = async (value?: string) => {
+const applyCurrentInput = async (value: string, event: Event ) => {
+  console.log('BBBBBBBBBBB',event);
   const keyword = (value ?? searchText.value).trim();
   if (!keyword) return;
 
@@ -274,7 +277,6 @@ onUnmounted(() => {
               :options="searchOptions"
               :filter-option="false"
               @search="handleSearch"
-              @select="handleSelect"
             >
               <a-input-search
                 size="large"
@@ -294,11 +296,7 @@ onUnmounted(() => {
                 <strong>显示悬浮窗</strong>
                 <span>临时关掉行情卡片，但保留配置。</span>
               </div>
-              <a-switch
-                :checked="config.enabled"
-                :loading="isSaving"
-                @change="updateEnabled"
-              />
+              <a-switch :checked="config.enabled" :loading="isSaving" @change="updateEnabled" />
             </div>
 
             <a-divider />
@@ -308,11 +306,7 @@ onUnmounted(() => {
                 <strong>默认展开图表</strong>
                 <span>刷新页面后直接展示分时图。</span>
               </div>
-              <a-switch
-                :checked="config.defaultExpanded"
-                :loading="isSaving"
-                @change="updateDefaultExpanded"
-              />
+              <a-switch :checked="config.defaultExpanded" :loading="isSaving" @change="updateDefaultExpanded" />
             </div>
 
             <a-divider />
@@ -323,7 +317,6 @@ onUnmounted(() => {
                 <a-input-number
                   :value="config.position.top"
                   :min="8"
-                  :max="600"
                   addon-after="px"
                   @change="updatePositionTop"
                 />
@@ -333,7 +326,6 @@ onUnmounted(() => {
                 <a-input-number
                   :value="config.position.right"
                   :min="8"
-                  :max="600"
                   addon-after="px"
                   @change="updatePositionRight"
                 />
@@ -425,9 +417,7 @@ h1 {
   width: 126px;
   height: 126px;
   border-radius: 999px;
-  background:
-    radial-gradient(circle at 32% 28%, #fef3c7, transparent 28%),
-    linear-gradient(135deg, #f97316, #facc15);
+  background: radial-gradient(circle at 32% 28%, #fef3c7, transparent 28%), linear-gradient(135deg, #f97316, #facc15);
   box-shadow: inset 0 0 24px rgba(255, 255, 255, 0.36);
 }
 
