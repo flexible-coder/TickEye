@@ -1,7 +1,7 @@
 ﻿<template>
   <div v-if="stockConfig.enabled" class="stock-widget-container" :style="widgetPositionStyle">
-    <div class="stock-card" :class="{ 'is-expanded': isExpanded }" @click="isExpanded = !isExpanded">
-      <div class="minimal-content">
+    <div ref="stockCardRef" class="stock-card" :class="{ 'is-expanded': isExpanded }">
+      <div class="minimal-content" @click="isExpanded = !isExpanded">
         <span class="stock-name">{{ stockData.name }}</span>
         <span class="stock-percent" :class="[trendClass, { 'price-flash': shouldFlash }]">
           {{ stockData.percent > 0 ? "+" : "" }}{{ stockData.percent.toFixed(2) }}%
@@ -110,6 +110,7 @@ type SeriesPoint = LineData<UTCTimestamp> | WhitespaceData<UTCTimestamp>;
 const stockConfig = ref<StockConfig>(DEFAULT_STOCK_CONFIG);
 const isExpanded = ref(DEFAULT_STOCK_CONFIG.defaultExpanded);
 const shouldFlash = ref(false);
+const stockCardRef = ref<HTMLDivElement | null>(null);
 const chartContainerRef = ref<HTMLDivElement | null>(null);
 const tooltipRef = ref<HTMLDivElement | null>(null);
 const rawData = ref<IntradayPoint[]>([]);
@@ -135,7 +136,8 @@ let lastAppliedTrendColor = "";
 const fullTradingMinuteIndexes = Array.from({ length: LAST_TRADING_MINUTE_INDEX + 1 }, (_, minuteIndex) => minuteIndex);
 
 const trendClass = computed(() => (stockData.value.percent >= 0 ? "up" : "down"));
-const trendColor = computed(() => (stockData.value.percent >= 0 ? "#f23645" : "#089981"));
+// const trendColor = computed(() => (stockData.value.percent >= 0 ? "#f23645" : "#089981"));
+const trendColor = ref<string>("#1677ff");
 const widgetPositionStyle = computed(() => ({
   top: `${stockConfig.value.position.top}px`,
   right: `${stockConfig.value.position.right}px`,
@@ -534,6 +536,14 @@ const handleRuntimeMessage = (message: { type?: string }) => {
   });
 };
 
+const handleDocumentClick = (event: MouseEvent) => {
+  if (!isExpanded.value) return;
+  if (stockCardRef.value?.contains(event.target as Node)) return;
+
+  isExpanded.value = false;
+  hideHover();
+};
+
 watch(
   () => stockData.value.price,
   () => {
@@ -655,7 +665,7 @@ const initChart = () => {
 
   priceLineSeries = chart.addSeries(LineSeries, {
     color: trendColor.value,
-    lineWidth: 2,
+    lineWidth: 1,
     priceFormat: {
       type: "custom",
       minMove: 0.01,
@@ -806,6 +816,7 @@ onMounted(async () => {
 
   await nextTick();
   isMounted = true;
+  document.addEventListener("click", handleDocumentClick);
   document.addEventListener("visibilitychange", refreshPollingSchedule);
   if (typeof chrome !== "undefined") {
     chrome.storage?.onChanged?.addListener(handleStockConfigStorageChange);
@@ -826,6 +837,7 @@ watch(isExpanded, async (expanded) => {
 
 onUnmounted(() => {
   isMounted = false;
+  document.removeEventListener("click", handleDocumentClick);
   document.removeEventListener("visibilitychange", refreshPollingSchedule);
   if (typeof chrome !== "undefined") {
     chrome.storage?.onChanged?.removeListener(handleStockConfigStorageChange);
