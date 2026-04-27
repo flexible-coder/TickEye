@@ -1,12 +1,12 @@
 {
-  "name": "crxjs-project",
+  "name": "TickEye",
   "type": "module",
   "version": "1.0.0",
   "private": true,
   "scripts": {
     "dev": "vite",
     "test": "vitest",
-    "build": "vue-tsc -b && vite build"
+    "build": "vite build"
   },
   "dependencies": {
     "ant-design-vue": "^4.2.6",
