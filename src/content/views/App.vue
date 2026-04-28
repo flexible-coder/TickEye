@@ -19,14 +19,37 @@
           </div>
         </div>
 
-        <div ref="chartContainerRef" class="chart-container"></div>
+        <div ref="chartContainerRef" class="chart-container">
+          <div v-if="priceAxisLabels.length" class="price-axis-overlay" aria-hidden="true">
+            <span
+              v-for="label in priceAxisLabels"
+              :key="label.priceText"
+              class="price-axis-label"
+              :class="label.className"
+              :style="{ top: `${label.y}px` }"
+            >
+              {{ label.priceText }}
+            </span>
+          </div>
+          <div v-if="priceAxisLabels.length" class="percent-axis-overlay" aria-hidden="true">
+            <span
+              v-for="label in priceAxisLabels"
+              :key="label.percentText"
+              class="percent-axis-label"
+              :class="label.className"
+              :style="{ top: `${label.y}px` }"
+            >
+              {{ label.percentText }}
+            </span>
+          </div>
+        </div>
 
         <div ref="tooltipRef" class="floating-tooltip" :class="{ visible: !!hoverInfo }">
           <div class="tooltip-time">
             <span>时间：</span>
             {{ hoverInfo?.time }}
           </div>
-          <div class="tooltip-price" :class="hoverInfo && hoverInfo.percent >= 0 ? 'up' : 'down'">
+          <div class="tooltip-price" :class="hoverInfo ? getTrendClassByPercent(hoverInfo.percent) : 'flat'">
             <span class="tooltip-label">价格：</span>
             <span> {{ hoverInfo?.price.toFixed(2) }}</span>
           </div>
@@ -34,9 +57,13 @@
             <span class="tooltip-label">均价：</span>
             <span>{{ hoverInfo?.avgPrice.toFixed(2) }}</span>
           </div>
-          <div class="tooltip-price" :class="hoverInfo && hoverInfo.percent >= 0 ? 'up' : 'down'">
+          <div class="tooltip-price" :class="hoverInfo ? getTrendClassByPercent(hoverInfo.percent) : 'flat'">
             <span class="tooltip-label">涨跌幅：</span>
             <span>{{ hoverPercentText }}</span>
+          </div>
+          <div class="tooltip-volume">
+            <span class="tooltip-label">成交量：</span>
+            <span>{{ hoverInfo ? formatVolume(hoverInfo.volume) : "--" }}</span>
           </div>
         </div>
       </div>
@@ -58,8 +85,10 @@ import {
   ColorType,
   createChart,
   CrosshairMode,
+  HistogramSeries,
   LineSeries,
   LineStyle,
+  type HistogramData,
   type IChartApi,
   type IPriceLine,
   type ISeriesApi,
@@ -79,6 +108,7 @@ interface HoverInfo {
   time: string;
   price: number;
   avgPrice: number;
+  volume: number;
   percent: number;
   x: number;
   y: number;
@@ -91,6 +121,19 @@ interface IntradayPoint {
   minuteIndex: number;
   value: number;
   avgPrice: number;
+  volume: number;
+}
+
+interface SymmetricPriceRange {
+  minValue: number;
+  maxValue: number;
+}
+
+interface PriceAxisLabel {
+  priceText: string;
+  percentText: string;
+  y: number;
+  className: string;
 }
 
 const MARKET_TIME_ZONE = "Asia/Shanghai";
@@ -102,10 +145,16 @@ const AFTERNOON_SESSION_END_MINUTE = 15 * 60;
 const MORNING_SESSION_POINT_COUNT = MORNING_SESSION_END_MINUTE - MORNING_SESSION_START_MINUTE + 1;
 const LAST_TRADING_MINUTE_INDEX = 240;
 const TIME_SCALE_EDGE_PADDING_BARS = 8;
+const MIN_PRICE_RANGE_RATIO = 0.01;
+const PRICE_SCALE_MARGIN_TOP = 0.02;
+const PRICE_SCALE_MARGIN_BOTTOM = 0.25;
+const VOLUME_SCALE_MARGIN_TOP = 0.78;
+const VOLUME_SCALE_MARGIN_BOTTOM = 0;
 const OFF_HOURS_POLL_INTERVAL_MS = 1000 * 60 * 2;
 const HIDDEN_POLL_INTERVAL_MS = 1000 * 60 * 3;
 
 type SeriesPoint = LineData<UTCTimestamp> | WhitespaceData<UTCTimestamp>;
+type VolumeSeriesPoint = HistogramData<UTCTimestamp> | WhitespaceData<UTCTimestamp>;
 
 const stockConfig = ref<StockConfig>(DEFAULT_STOCK_CONFIG);
 const isExpanded = ref(DEFAULT_STOCK_CONFIG.defaultExpanded);
@@ -117,6 +166,7 @@ const rawData = ref<IntradayPoint[]>([]);
 const hoverInfo = ref<HoverInfo | null>(null);
 const preClosePrice = ref(0);
 const isFetching = ref(false);
+const priceAxisLabels = ref<PriceAxisLabel[]>([]);
 
 const stockData = ref<Stock>({
   name: "加载中...",
@@ -126,6 +176,8 @@ const stockData = ref<Stock>({
 
 let chart: IChartApi | null = null;
 let priceLineSeries: ISeriesApi<"Line"> | null = null;
+let avgLineSeries: ISeriesApi<"Line"> | null = null;
+let volumeSeries: ISeriesApi<"Histogram"> | null = null;
 let preClosePriceLine: IPriceLine | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let pollingTimer: ReturnType<typeof setTimeout> | null = null;
@@ -135,9 +187,20 @@ let lastAppliedTrendColor = "";
 
 const fullTradingMinuteIndexes = Array.from({ length: LAST_TRADING_MINUTE_INDEX + 1 }, (_, minuteIndex) => minuteIndex);
 
-const trendClass = computed(() => (stockData.value.percent >= 0 ? "up" : "down"));
-// const trendColor = computed(() => (stockData.value.percent >= 0 ? "#f23645" : "#089981"));
-const trendColor = ref<string>("#1677ff");
+const getTrendClassByPercent = (percent: number): "up" | "down" | "flat" => {
+  if (percent > 0) return "up";
+  if (percent < 0) return "down";
+  return "flat";
+};
+
+const getTrendColorByPercent = (percent: number): string => {
+  if (percent > 0) return "#f23645";
+  if (percent < 0) return "#089981";
+  return "#758696";
+};
+
+const trendClass = computed(() => getTrendClassByPercent(stockData.value.percent));
+const trendColor = computed(() => getTrendColorByPercent(stockData.value.percent));
 const widgetPositionStyle = computed(() => ({
   top: `${stockConfig.value.position.top}px`,
   right: `${stockConfig.value.position.right}px`,
@@ -151,32 +214,127 @@ const latestTime = computed(() => {
 const displayTime = computed(() => hoverInfo.value?.time ?? latestTime.value);
 const displayPrice = computed(() => hoverInfo.value?.price ?? stockData.value.price);
 const displayPercent = computed(() => hoverInfo.value?.percent ?? stockData.value.percent);
-const displayTrendClass = computed(() => (displayPercent.value >= 0 ? "up" : "down"));
-const displayPercentText = computed(() => `${displayPercent.value > 0 ? "+" : ""}${displayPercent.value.toFixed(2)}%`);
+const displayTrendClass = computed(() => getTrendClassByPercent(displayPercent.value));
+const formatSignedPercent = (percent: number): string => `${percent > 0 ? "+" : ""}${percent.toFixed(2)}%`;
+const displayPercentText = computed(() => formatSignedPercent(displayPercent.value));
 const hoverPercentText = computed(() => {
   if (!hoverInfo.value) return "";
-  return `${hoverInfo.value.percent > 0 ? "+" : ""}${hoverInfo.value.percent.toFixed(2)}%`;
+  return formatSignedPercent(hoverInfo.value.percent);
 });
 
-const buildFullTradingSeriesData = (points: IntradayPoint[]): SeriesPoint[] => {
+const buildFullTradingSeriesData = (
+  points: IntradayPoint[],
+  valueGetter: (point: IntradayPoint) => number,
+): SeriesPoint[] => {
   const pointByMinuteIndex = new Map(points.map((point) => [point.minuteIndex, point]));
 
   return fullTradingMinuteIndexes.map((minuteIndex) => {
     const time = minuteIndexToSyntheticTimestamp(minuteIndex);
     const point = pointByMinuteIndex.get(minuteIndex);
-    return point ? { time, value: point.value } : { time };
+    return point ? { time, value: valueGetter(point) } : { time };
   });
 };
 
-const seriesData = computed<SeriesPoint[]>(() => buildFullTradingSeriesData(rawData.value));
+const buildVolumeSeriesData = (points: IntradayPoint[]): VolumeSeriesPoint[] => {
+  const pointByMinuteIndex = new Map(points.map((point) => [point.minuteIndex, point]));
+
+  return fullTradingMinuteIndexes.map((minuteIndex) => {
+    const time = minuteIndexToSyntheticTimestamp(minuteIndex);
+    const point = pointByMinuteIndex.get(minuteIndex);
+    if (!point) return { time };
+
+    const previousPoint = pointByMinuteIndex.get(minuteIndex - 1);
+    const comparePrice = previousPoint?.value ?? preClosePrice.value;
+    const color = comparePrice > 0 && point.value < comparePrice ? "#089981" : "#f23645";
+
+    return {
+      time,
+      value: point.volume,
+      color,
+    };
+  });
+};
+
+const seriesData = computed<SeriesPoint[]>(() => buildFullTradingSeriesData(rawData.value, (point) => point.value));
+const avgSeriesData = computed<SeriesPoint[]>(() => buildFullTradingSeriesData(rawData.value, (point) => point.avgPrice));
+const volumeSeriesData = computed<VolumeSeriesPoint[]>(() => buildVolumeSeriesData(rawData.value));
 const pointIndex = computed(() => new Map(rawData.value.map((point) => [point.time, point])));
 
-const formatPriceAsPercent = (price: number): string => {
-  if (preClosePrice.value <= 0) {
-    return `${price.toFixed(2)}`;
+const calculateSymmetricPriceRange = (points: IntradayPoint[], preClose: number): SymmetricPriceRange | null => {
+  if (preClose <= 0) return null;
+
+  const validPrices = points.map((point) => point.value).filter((price) => Number.isFinite(price) && price > 0);
+  const minDiff = Math.max(preClose * MIN_PRICE_RANGE_RATIO, 0.01);
+
+  if (validPrices.length === 0) {
+    return {
+      minValue: preClose - minDiff,
+      maxValue: preClose + minDiff,
+    };
   }
-  const percent = ((price - preClosePrice.value) / preClosePrice.value) * 100;
-  return `${percent > 0 ? "+" : ""}${percent.toFixed(2)}%`;
+
+  const maxPrice = Math.max(...validPrices);
+  const minPrice = Math.min(...validPrices);
+  const maxDiff = Math.max(Math.abs(maxPrice - preClose), Math.abs(minPrice - preClose), minDiff);
+
+  return {
+    minValue: preClose - maxDiff,
+    maxValue: preClose + maxDiff,
+  };
+};
+
+const yAxisPriceRange = computed(() => calculateSymmetricPriceRange(rawData.value, preClosePrice.value));
+
+const getSymmetricAutoscaleInfo = () => {
+  const range = yAxisPriceRange.value;
+  if (!range) return null;
+
+  return {
+    priceRange: range,
+    margins: {
+      above: 0,
+      below: 0,
+    },
+  };
+};
+
+const getAxisLabelPriceValues = (): number[] => {
+  const range = yAxisPriceRange.value;
+  if (!range || preClosePrice.value <= 0) return [];
+
+  return [
+    range.maxValue,
+    (range.maxValue + preClosePrice.value) / 2,
+    preClosePrice.value,
+    (range.minValue + preClosePrice.value) / 2,
+    range.minValue,
+  ];
+};
+
+const formatVolume = (volume: number): string => {
+  if (!Number.isFinite(volume) || volume <= 0) return "0";
+  if (volume >= 10000) return `${(volume / 10000).toFixed(2)}万`;
+  return `${Math.round(volume)}`;
+};
+
+const syncAxisOverlayLabels = () => {
+  if (!priceLineSeries || preClosePrice.value <= 0) {
+    priceAxisLabels.value = [];
+    return;
+  }
+
+  priceAxisLabels.value = getAxisLabelPriceValues().flatMap((price) => {
+    const y = priceLineSeries?.priceToCoordinate(price);
+    if (y === null || y === undefined) return [];
+
+    const percent = ((price - preClosePrice.value) / preClosePrice.value) * 100;
+    return {
+      priceText: price.toFixed(2),
+      percentText: formatSignedPercent(percent),
+      y,
+      className: getTrendClassByPercent(percent),
+    };
+  });
 };
 
 const getTimestampFromTime = (time: Time | undefined): number | null => {
@@ -418,7 +576,8 @@ const isSameRawData = (next: IntradayPoint[]): boolean => {
   const lastPrev = prev[prev.length - 1];
   const lastNext = next[next.length - 1];
   if (lastPrev.realTime !== lastNext.realTime || lastPrev.value !== lastNext.value) return false;
-  if (lastPrev.avgPrice !== lastNext.avgPrice || lastPrev.marketTime !== lastNext.marketTime) return false;
+  if (lastPrev.avgPrice !== lastNext.avgPrice || lastPrev.volume !== lastNext.volume) return false;
+  if (lastPrev.marketTime !== lastNext.marketTime) return false;
 
   const firstPrev = prev[0];
   const firstNext = next[0];
@@ -426,6 +585,7 @@ const isSameRawData = (next: IntradayPoint[]): boolean => {
     firstPrev.realTime === firstNext.realTime &&
     firstPrev.value === firstNext.value &&
     firstPrev.avgPrice === firstNext.avgPrice &&
+    firstPrev.volume === firstNext.volume &&
     firstPrev.marketTime === firstNext.marketTime
   );
 };
@@ -461,10 +621,15 @@ const syncPreClosePriceLine = () => {
   preClosePriceLine = priceLineSeries.createPriceLine(options);
 };
 
+const requestAxisOverlaySync = () => {
+  requestAnimationFrame(syncAxisOverlayLabels);
+};
+
 const applyFullTradingVisibleRange = () => {
   if (!chart) return;
   chart.timeScale().fitContent();
   chart.timeScale().setVisibleLogicalRange(getFullTradingVisibleLogicalRange());
+  requestAxisOverlaySync();
 };
 
 const applySeriesData = (nextData: SeriesPoint[]) => {
@@ -473,9 +638,25 @@ const applySeriesData = (nextData: SeriesPoint[]) => {
   applyFullTradingVisibleRange();
 };
 
+const applyAvgSeriesData = (nextData: SeriesPoint[]) => {
+  if (!avgLineSeries) return;
+  avgLineSeries.setData(nextData);
+  applyFullTradingVisibleRange();
+};
+
+const applyVolumeSeriesData = (nextData: VolumeSeriesPoint[]) => {
+  if (!volumeSeries) return;
+  volumeSeries.setData(nextData);
+  applyFullTradingVisibleRange();
+};
+
 const syncPriceSeriesData = (next: IntradayPoint[]) => {
   if (!priceLineSeries) return;
-  applySeriesData(buildFullTradingSeriesData(next));
+  const nextPriceData = buildFullTradingSeriesData(next, (point) => point.value);
+  const nextAvgData = buildFullTradingSeriesData(next, (point) => point.avgPrice);
+  applySeriesData(nextPriceData);
+  applyAvgSeriesData(nextAvgData);
+  applyVolumeSeriesData(buildVolumeSeriesData(next));
 };
 
 const resetStockState = () => {
@@ -487,8 +668,13 @@ const resetStockState = () => {
     price: 0,
     percent: 0,
   };
+  priceAxisLabels.value = [];
   syncPreClosePriceLine();
-  applySeriesData(buildFullTradingSeriesData([]));
+  const emptyPriceData = buildFullTradingSeriesData([], (point) => point.value);
+  const emptyAvgData = buildFullTradingSeriesData([], (point) => point.avgPrice);
+  applySeriesData(emptyPriceData);
+  applyAvgSeriesData(emptyAvgData);
+  applyVolumeSeriesData(buildVolumeSeriesData([]));
 };
 
 const applyStockConfig = (nextConfig: Partial<StockConfig> | undefined) => {
@@ -625,14 +811,26 @@ const initChart = () => {
         labelBackgroundColor: "#666",
       },
     },
-    rightPriceScale: {
+    leftPriceScale: {
+      visible: false,
       borderColor: "rgba(0,0,0,0.1)",
       borderVisible: true,
       ensureEdgeTickMarksVisible: true,
       entireTextOnly: false,
       scaleMargins: {
-        top: 0.02,
-        bottom: 0.02,
+        top: PRICE_SCALE_MARGIN_TOP,
+        bottom: PRICE_SCALE_MARGIN_BOTTOM,
+      },
+    },
+    rightPriceScale: {
+      visible: false,
+      borderColor: "rgba(0,0,0,0.1)",
+      borderVisible: true,
+      ensureEdgeTickMarksVisible: true,
+      entireTextOnly: false,
+      scaleMargins: {
+        top: PRICE_SCALE_MARGIN_TOP,
+        bottom: PRICE_SCALE_MARGIN_BOTTOM,
       },
     },
     timeScale: {
@@ -640,10 +838,8 @@ const initChart = () => {
       borderColor: "rgba(0,0,0,0.1)",
       timeVisible:true,
       fixLeftEdge: true,
-      // fixRightEdge: true,
       secondsVisible: false,
       ticksVisible:false,
-      // tickMarkMaxCharacterLength :5,
       tickMarkFormatter: (time: Time) => formatAxisTimeFromChartTime(time),
     },
     handleScroll: { vertTouchDrag: false },
@@ -658,19 +854,43 @@ const initChart = () => {
       if (nextWidth > 0) {
         chart.applyOptions({ width: nextWidth, height: nextHeight || 120 });
         applyFullTradingVisibleRange();
+        requestAxisOverlaySync();
       }
     }
   });
   resizeObserver.observe(chartContainerRef.value);
 
+  volumeSeries = chart.addSeries(HistogramSeries, {
+    priceScaleId: "volume",
+    priceFormat: {
+      type: "volume",
+    },
+    priceLineVisible: false,
+    lastValueVisible: false,
+  });
+  chart.priceScale("volume").applyOptions({
+    scaleMargins: {
+      top: VOLUME_SCALE_MARGIN_TOP,
+      bottom: VOLUME_SCALE_MARGIN_BOTTOM,
+    },
+  });
+
+  avgLineSeries = chart.addSeries(LineSeries, {
+    priceScaleId: "left",
+    color: "#f5a623",
+    lineWidth: 1,
+    autoscaleInfoProvider: getSymmetricAutoscaleInfo,
+    priceLineVisible: false,
+    lastValueVisible: false,
+    crosshairMarkerVisible: false,
+  });
+
   priceLineSeries = chart.addSeries(LineSeries, {
+    priceScaleId: "left",
     color: trendColor.value,
     lineWidth: 1,
-    priceFormat: {
-      type: "custom",
-      minMove: 0.01,
-      formatter: formatPriceAsPercent,
-    },
+    priceFormat: { type: "price", minMove: 0.01 },
+    autoscaleInfoProvider: getSymmetricAutoscaleInfo,
     priceLineVisible: false,
     lastValueVisible: false,
     crosshairMarkerVisible: true,
@@ -709,6 +929,7 @@ const initChart = () => {
       time: point.marketTime,
       price: point.value,
       avgPrice: point.avgPrice,
+      volume: point.volume,
       percent: ((point.value - preClosePrice.value) / preClosePrice.value) * 100,
       x: param.point.x,
       y: param.point.y,
@@ -723,7 +944,10 @@ const initChart = () => {
 
   chartContainerRef.value.addEventListener("mouseleave", hideHover);
   applySeriesData(seriesData.value);
+  applyAvgSeriesData(avgSeriesData.value);
+  applyVolumeSeriesData(volumeSeriesData.value);
   applyFullTradingVisibleRange();
+  requestAxisOverlaySync();
 };
 
 const fetchIntradayData = async () => {
@@ -757,6 +981,7 @@ const fetchIntradayData = async () => {
       const timeStr = fields[0];
       const price = getTrendPrice(fields) ?? 0;
       const avgPrice = getTrendAveragePrice(fields, price);
+      const volume = parseFiniteNumber(fields[5]) ?? 0;
 
       if (price <= 0 || avgPrice <= 0) continue;
 
@@ -773,6 +998,7 @@ const fetchIntradayData = async () => {
         minuteIndex,
         value: price,
         avgPrice,
+        volume,
       });
       currentPrice = price;
     }
@@ -862,6 +1088,8 @@ onUnmounted(() => {
   }
 
   priceLineSeries = null;
+  avgLineSeries = null;
+  volumeSeries = null;
   preClosePriceLine = null;
   lastAppliedTrendColor = "";
 });
@@ -1039,6 +1267,17 @@ onUnmounted(() => {
   color: #f5a623;
 }
 
+.tooltip-volume {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  color: #475569;
+  font-size: 12px;
+  .tooltip-label {
+    color: #666;
+  }
+}
+
 .chart-container {
   height: 250px;
   width: 100%;
@@ -1046,6 +1285,37 @@ onUnmounted(() => {
   border-radius: 4px;
   position: relative;
   overflow: hidden;
+}
+
+.price-axis-overlay,
+.percent-axis-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  pointer-events: none;
+}
+
+.price-axis-label,
+.percent-axis-label {
+  position: absolute;
+  transform: translateY(-50%);
+  font-size: 10px;
+  line-height: 1;
+  font-weight: 600;
+  text-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.9),
+    0 -1px 0 rgba(255, 255, 255, 0.9);
+  white-space: nowrap;
+}
+
+.price-axis-label {
+  left: 3px;
+  padding-right: 6px;
+}
+
+.percent-axis-label {
+  right: 3px;
+  padding-left: 6px;
 }
 
 .up {
@@ -1062,5 +1332,13 @@ onUnmounted(() => {
 
 .down.stock-percent {
   background: rgba(8, 153, 129, 0.12);
+}
+
+.flat {
+  color: #758696;
+}
+
+.flat.stock-percent {
+  background: rgba(117, 134, 150, 0.12);
 }
 </style>
