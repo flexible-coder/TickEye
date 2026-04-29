@@ -20,6 +20,12 @@
         </div>
 
         <div ref="chartContainerRef" class="chart-container">
+          <div
+            v-if="volumeDividerTop !== null"
+            class="volume-divider"
+            aria-hidden="true"
+            :style="{ top: `${volumeDividerTop}px` }"
+          ></div>
           <div v-if="priceAxisLabels.length" class="price-axis-overlay" aria-hidden="true">
             <span
               v-for="label in priceAxisLabels"
@@ -167,6 +173,7 @@ const hoverInfo = ref<HoverInfo | null>(null);
 const preClosePrice = ref(0);
 const isFetching = ref(false);
 const priceAxisLabels = ref<PriceAxisLabel[]>([]);
+const volumeDividerTop = ref<number | null>(null);
 
 const stockData = ref<Stock>({
   name: "加载中...",
@@ -320,8 +327,13 @@ const formatVolume = (volume: number): string => {
 const syncAxisOverlayLabels = () => {
   if (!priceLineSeries || preClosePrice.value <= 0) {
     priceAxisLabels.value = [];
+    volumeDividerTop.value = null;
     return;
   }
+
+  const range = yAxisPriceRange.value;
+  const dividerY = range ? priceLineSeries.priceToCoordinate(range.minValue) : null;
+  volumeDividerTop.value = dividerY === null ? null : dividerY;
 
   priceAxisLabels.value = getAxisLabelPriceValues().flatMap((price) => {
     const y = priceLineSeries?.priceToCoordinate(price);
@@ -669,6 +681,7 @@ const resetStockState = () => {
     percent: 0,
   };
   priceAxisLabels.value = [];
+  volumeDividerTop.value = null;
   syncPreClosePriceLine();
   const emptyPriceData = buildFullTradingSeriesData([], (point) => point.value);
   const emptyAvgData = buildFullTradingSeriesData([], (point) => point.avgPrice);
@@ -1285,6 +1298,16 @@ onUnmounted(() => {
   border-radius: 4px;
   position: relative;
   overflow: hidden;
+}
+
+.volume-divider {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: rgba(15, 23, 42, 0.12);
+  pointer-events: none;
+  z-index: 5;
 }
 
 .price-axis-overlay,
